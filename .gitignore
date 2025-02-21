@@ -1,0 +1,56 @@
+# dependencies
+node_modules
+
+# environment
+.env
+
+# Hardhat files
+/cache
+/artifacts
+
+# Foundry broadcasts
+!broadcast
+broadcast/*
+broadcast/*/31337/
+
+# Forge files
+/lib/forge-std/
+/out
+/cache_forge
+.gas-snapshot
+
+# TypeChain files
+/typechain
+/typechain-types
+
+# solidity-coverage files
+/coverage
+/coverage.json
+
+# Hardhat Ignition default folder for deployments against a local node
+ignition/deployments/chain-31337
+
+# IDEs and editors
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+.vscode/
+.vscode/*
+
+# misc
+/.sass-cache
+/connect.lock
+/coverage
+/libpeerconnection.log
+npm-debug.log
+yarn-error.log
+testem.log
+/typings
+
+# System Files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,40 @@
+{
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "5.0.0",
+    "@solidstate/contracts": "0.0.60",
+    "@typescript-eslint/eslint-plugin": "^5.62.0",
+    "@typescript-eslint/parser": "^5.62.0",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.30.0",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-prettier": "^5.2.1",
+    "hardhat": "^2.22.12",
+    "prettier": "^3.3.3",
+    "prettier-plugin-solidity": "^1.4.1"
+  },
+  "dependencies": {
+    "@nomicfoundation/hardhat-foundry": "1.1.2",
+    "@openzeppelin/contracts": "5.1.0",
+    "@openzeppelin/contracts-upgradeable": "5.1.0"
+  },
+  "scripts": {
+    "lint": "eslint './**/*.{ts,js}'",
+    "format": "prettier --write './**/*.{ts,js,json,md}' && npx prettier --write --plugin=prettier-plugin-solidity 'contracts/**/*.sol'"
+  },
+  "prettier": {
+    "plugins": [
+      "prettier-plugin-solidity"
+    ],
+    "overrides": [
+      {
+        "files": "*.sol",
+        "options": {
+          "parser": "solidity-parse",
+          "printWidth": 120,
+          "singleQuote": false
+        }
+      }
+    ]
+  }
+}
