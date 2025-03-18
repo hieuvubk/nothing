@@ -5,7 +5,7 @@ import {IERC721Base} from "@solidstate/contracts/token/ERC721/base/IERC721Base.s
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {LibLandBank} from "../libraries/LibLandBank.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuard} from "@solidstate/contracts/security/reentrancy_guard/ReentrancyGuard.sol";
 
 interface IMintableToken is IERC20 {
     function mint(address to, uint256 amount) external;
@@ -14,11 +14,7 @@ interface IMintableToken is IERC20 {
 
 contract LandBankStakingFacet is ReentrancyGuard {
     using EnumerableSet for EnumerableSet.UintSet;
-
-    // Constants for supply allocation
-    uint256 public constant USER_TOTAL_SUPPLY = 100_000_000 * 1e18; // 100M allocated for LandPixel minting and staking
-    uint256 public constant PRECISION = 1e18;
-    uint256 public constant STAKE_REWARD_BASE_DIVISOR = 100_000_000; // stake rewards are 1/100M remaining supply
+    using LibLandBank for LibLandBank.LandBankStorage;
 
     // Events
     event Staked(address indexed user, uint256 indexed tokenId);
@@ -38,7 +34,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         // Sanity check to avoid any value underflow issues
         if (currentAccumulatedRewards <= stake.rewardDebt) return 0;
 
-        return (currentAccumulatedRewards - stake.rewardDebt) / PRECISION;
+        return (currentAccumulatedRewards - stake.rewardDebt) / LibLandBank.PRECISION;
     }
 
     // Function to calculate current total staking rewards per block
@@ -47,42 +43,17 @@ contract LandBankStakingFacet is ReentrancyGuard {
 
         if (s.totalStaked == 0) return 0;
 
-        uint256 remainingAllocation = USER_TOTAL_SUPPLY - s.stakingMintedRewards;
+        uint256 remainingAllocation = LibLandBank.USER_TOTAL_SUPPLY - s.stakingMintedRewards;
 
         // Calculate the reward per block as 1/100M of remaining allocation
-        return remainingAllocation / STAKE_REWARD_BASE_DIVISOR;
-    }
-
-    // Helper function for staking reward accumulator updates
-    function _updateAccumulatedRewards() internal {
-        LibLandBank.LandBankStorage storage s = LibLandBank.getStorage();
-
-        if (block.number <= s.lastUpdateBlock) return;
-        if (s.totalStaked == 0) {
-            s.lastUpdateBlock = block.number;
-            return;
-        }
-
-        uint256 blocksSinceUpdate = block.number - s.lastUpdateBlock;
-        uint256 rewardPerBlock = calculateRewardPerBlock();
-
-        uint256 rewardPerBlockScaled = (rewardPerBlock * PRECISION) / s.totalStaked;
-        uint256 additionalRewards = rewardPerBlockScaled * blocksSinceUpdate;
-
-        // Check for overflow before adding to accumulatedRewardsPerShare
-        if (additionalRewards > type(uint256).max - s.accumulatedRewardsPerShare) {
-            revert("Accumulated rewards overflow");
-        }
-
-        s.accumulatedRewardsPerShare += additionalRewards;
-        s.lastUpdateBlock = block.number;
+        return remainingAllocation / LibLandBank.STAKE_REWARD_BASE_DIVISOR;
     }
 
     /*******************************************************************************************\
      *  @dev stakeLandPixel: function to stake a LandPixel in the LandBank
      *  @param tokenId the District ID of the LandPixel being staked
      *  The LandBank contract must be approved for transferring the LandPixel NFT
-     *  This will call _updateAccumulatedRewards to ensure the accumulator factors in the stake
+     *  This calls LibLandBank.updateAccumulatedRewards so the accumulator factors in the stake
      *  This emits a {Staked} event
     \*******************************************************************************************/
     function stakeLandPixel(uint256 tokenId) external nonReentrant {
@@ -92,7 +63,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         require(nftContract.ownerOf(tokenId) == msg.sender, "Not token owner");
         require(s.tokenStakes[tokenId].owner == address(0), "Already staked");
 
-        _updateAccumulatedRewards();
+        LibLandBank.updateAccumulatedRewards();
 
         // Transfer NFT to contract
         nftContract.transferFrom(msg.sender, address(this), tokenId);
@@ -114,7 +85,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
     /*******************************************************************************************\
      *  @dev unstakeLandPixel: function to unstake a LandPixel and withdraw it from the LandBank
      *  @param tokenId the District ID of the LandPixel being unstaked
-     *  This will call _updateAccumulatedRewards to ensure the accumulator updates
+     *  This calls LibLandBank.updateAccumulatedRewards to ensure that the accumulator updates
      *  This emits an {Unstaked} event
     \*******************************************************************************************/
     function unstakeLandPixel(uint256 tokenId) external nonReentrant {
@@ -123,7 +94,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         LibLandBank.Stake storage stake = s.tokenStakes[tokenId];
         require(stake.owner == msg.sender, "Not stake owner");
 
-        _updateAccumulatedRewards();
+        LibLandBank.updateAccumulatedRewards();
 
         // Calculate and add pending rewards
         uint256 pending = _calculateTokenRewards(tokenId, s.accumulatedRewardsPerShare);
@@ -148,7 +119,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
     /*******************************************************************************************\
      * @dev claimRewardForToken: claims rewards for a single staked LandPixel token
      * @param tokenId the ID of the LandPixel token to claim rewards for
-     * This will call _updateAccumulatedRewards to ensure the accumulator updates properly
+     * This calls LibLandBank.updateAccumulatedRewards so the accumulator updates properly
      * The staking rewards will be minted directly to the claiming user
      * This emits a {RewardsClaimed} event
     \*******************************************************************************************/
@@ -158,7 +129,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
 
         require(stake.owner == msg.sender, "Not stake owner");
 
-        _updateAccumulatedRewards();
+        LibLandBank.updateAccumulatedRewards();
 
         uint256 pending = _calculateTokenRewards(tokenId, s.accumulatedRewardsPerShare);
         require(pending > 0, "No rewards to claim");
@@ -170,7 +141,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         s.stakingMintedRewards += pending;
 
         // Ensure we don't exceed our allocation
-        require(s.stakingMintedRewards <= USER_TOTAL_SUPPLY, "Exceeds staking allocation");
+        require(s.stakingMintedRewards <= LibLandBank.USER_TOTAL_SUPPLY, "Exceeds staking allocation");
 
         // Mint rewards directly to user
         IMintableToken(s.dstrxTokenAddress).mint(msg.sender, pending);
@@ -180,7 +151,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
 
     /*******************************************************************************************\
      *  @dev claimAllRewards: function to claim all staking rewards for the calling user
-     *  This will call _updateAccumulatedRewards to ensure the accumulator updates properly
+     *  This calls LibLandBank.updateAccumulatedRewards so the accumulator updates properly
      *  The staking rewards will be minted directly to the claiming user
      *  This emits a {RewardsClaimed} event
     \*******************************************************************************************/
@@ -188,7 +159,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         LibLandBank.LandBankStorage storage s = LibLandBank.getStorage();
         EnumerableSet.UintSet storage userTokens = s.userTokenIds[msg.sender];
 
-        _updateAccumulatedRewards();
+        LibLandBank.updateAccumulatedRewards();
         uint256 totalPending = s.userPendingRewards[msg.sender];
 
         // Calculate rewards for currently staked tokens
@@ -199,7 +170,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
 
             // Sanity check for value underflow
             if (s.accumulatedRewardsPerShare > stake.rewardDebt) {
-                uint256 pending = (s.accumulatedRewardsPerShare - stake.rewardDebt) / PRECISION;
+                uint256 pending = (s.accumulatedRewardsPerShare - stake.rewardDebt) / LibLandBank.PRECISION;
                 totalPending += pending;
             }
 
@@ -217,7 +188,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         s.stakingMintedRewards += totalPending;
 
         // Ensure we don't exceed our allocation
-        require(s.stakingMintedRewards <= USER_TOTAL_SUPPLY, "Exceeds staking allocation");
+        require(s.stakingMintedRewards <= LibLandBank.USER_TOTAL_SUPPLY, "Exceeds staking allocation");
 
         // Mint rewards directly to user
         IMintableToken(s.dstrxTokenAddress).mint(msg.sender, totalPending);
@@ -237,7 +208,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         if (block.number > s.lastUpdateBlock && s.totalStaked > 0) {
             uint256 blocksSinceUpdate = block.number - s.lastUpdateBlock;
             uint256 rewardPerBlock = calculateRewardPerBlock();
-            uint256 additionalRewards = (rewardPerBlock * blocksSinceUpdate * PRECISION) / s.totalStaked;
+            uint256 additionalRewards = (rewardPerBlock * blocksSinceUpdate * LibLandBank.PRECISION) / s.totalStaked;
             currentAccumulatedRewards += additionalRewards;
         }
 
@@ -247,11 +218,16 @@ contract LandBankStakingFacet is ReentrancyGuard {
             uint256 tokenId = userTokens.at(i);
             LibLandBank.Stake storage stake = s.tokenStakes[tokenId];
             if (stake.owner == user) {
-                pending += (currentAccumulatedRewards - stake.rewardDebt) / PRECISION;
+                pending += (currentAccumulatedRewards - stake.rewardDebt) / LibLandBank.PRECISION;
             }
         }
 
         return pending;
+    }
+
+    // View function to see how much of the initial 100M reward token is not-yet-minted
+    function getRemainingSupply() external view returns (uint256) {
+        return LibLandBank.getRemainingSupply();
     }
 
     // View function to get user's actively staked token IDs
@@ -281,7 +257,7 @@ contract LandBankStakingFacet is ReentrancyGuard {
         if (block.number > s.lastUpdateBlock && s.totalStaked > 0) {
             uint256 blocksSinceUpdate = block.number - s.lastUpdateBlock;
             uint256 rewardPerBlock = calculateRewardPerBlock();
-            uint256 additionalRewards = (rewardPerBlock * blocksSinceUpdate * PRECISION) / s.totalStaked;
+            uint256 additionalRewards = (rewardPerBlock * blocksSinceUpdate * LibLandBank.PRECISION) / s.totalStaked;
             currentAccumulatedRewards += additionalRewards;
         }
 
@@ -297,11 +273,5 @@ contract LandBankStakingFacet is ReentrancyGuard {
     function getUserTotalStaked(address user) external view returns (uint256) {
         LibLandBank.LandBankStorage storage s = LibLandBank.getStorage();
         return s.userTokenIds[user].length();
-    }
-
-    // View function to see how much of the initial 100M reward token is not-yet-minted
-    function getRemainingSupply() external view returns (uint256) {
-        LibLandBank.LandBankStorage storage s = LibLandBank.getStorage();
-        return USER_TOTAL_SUPPLY - s.stakingMintedRewards;
     }
 }

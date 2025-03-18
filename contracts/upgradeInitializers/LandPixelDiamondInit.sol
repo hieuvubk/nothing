@@ -8,21 +8,11 @@ import {IERC173} from "@solidstate/contracts/interfaces/IERC173.sol";
 import {IERC165} from "@solidstate/contracts/interfaces/IERC165.sol";
 import {LandPixelFacet} from "../facets/LandPixelFacet.sol";
 import {LibLandPixel} from "../libraries/LibLandPixel.sol";
-import {AccessControlInternal} from "@solidstate/contracts/access/access_control/AccessControlInternal.sol";
+import {IERC721} from "@solidstate/contracts/interfaces/IERC721.sol";
+import {IERC721Metadata} from "@solidstate/contracts/token/ERC721/metadata/IERC721Metadata.sol";
+import {IERC721Enumerable} from "@solidstate/contracts/token/ERC721/enumerable/IERC721Enumerable.sol";
 
 contract LandPixelDiamondInit {
-    bytes32 constant OWNABLE_STORAGE_SLOT = keccak256("ownable.storage");
-
-    struct OwnableStorage {
-        address owner;
-    }
-
-    function getOwnableStorage() internal pure returns (OwnableStorage storage os) {
-        bytes32 slot = OWNABLE_STORAGE_SLOT;
-        assembly {
-            os.slot := slot
-        }
-    }
     // custom state variables
     function init() external {
         // adding ERC165 data
@@ -32,9 +22,13 @@ contract LandPixelDiamondInit {
         ds.supportedInterfaces[type(IDiamondLoupe).interfaceId] = true;
         ds.supportedInterfaces[type(IERC173).interfaceId] = true;
 
+        // Add ERC721 interfaces
+        ds.supportedInterfaces[type(IERC721).interfaceId] = true;
+        ds.supportedInterfaces[type(IERC721Metadata).interfaceId] = true;
+        ds.supportedInterfaces[type(IERC721Enumerable).interfaceId] = true;
+
         // Initialize ownership
-        OwnableStorage storage os = getOwnableStorage();
-        os.owner = msg.sender;
+        LibDiamond.setContractOwner(msg.sender);
 
         // EIP-2535 specifies that the `diamondCut` function takes two optional
         // arguments: address _init and bytes calldata _calldata

@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {IERC721Base} from "@solidstate/contracts/token/ERC721/base/IERC721Base.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ReentrancyGuard} from "@solidstate/contracts/security/reentrancy_guard/ReentrancyGuard.sol";
 import {LibLandBank} from "../libraries/LibLandBank.sol";
 
 interface IMintableERC20 is IERC20 {
@@ -53,7 +53,7 @@ contract LandBankMainFacet is ReentrancyGuard {
      *  This emits {LandPixelMinted} events per LandPixel; mintings emit {Transfer} events
     \*******************************************************************************************/
     function mintLandPixels(uint256[] memory tokenIds) external payable nonReentrant {
-        LibLandBank.LandBankStorage storage s = getStorage(); // Calculate total minting cost required
+        LibLandBank.LandBankStorage storage s = getStorage();
         uint256 totalCost = s.pixelCost * tokenIds.length;
 
         if (msg.value < totalCost) {
@@ -61,35 +61,47 @@ contract LandBankMainFacet is ReentrancyGuard {
         }
 
         uint256 pixelCount = tokenIds.length;
+        uint256 userMintAmount = 0;
+        uint256 bankMintAmount = 0;
 
-        // Use stakingMintedRewards to track user-minted portion
-        uint256 userMinted = s.stakingMintedRewards;
-        uint256 userRemaining = USER_TOTAL_SUPPLY - userMinted;
+        // Update accumulated rewards before modifying stakingMintedRewards
+        LibLandBank.updateAccumulatedRewards();
 
-        // Calculate user mint amount (decreasing based on remaining supply)
-        uint256 userMintAmount = (pixelCount * INITIAL_USER_MINT * userRemaining) / USER_TOTAL_SUPPLY;
+        // Calculate rewards only if there's remaining allocation
+        if (s.stakingMintedRewards < USER_TOTAL_SUPPLY) {
+            // Use stakingMintedRewards to track user-minted portion
+            uint256 userMinted = s.stakingMintedRewards;
+            uint256 userRemaining = USER_TOTAL_SUPPLY - userMinted;
 
-        // Calculate proportional bank mint amount
-        uint256 bankMintAmount = (userMintAmount * BANK_TOTAL_SUPPLY) / USER_TOTAL_SUPPLY;
+            // Calculate user mint amount (decreasing based on remaining supply)
+            userMintAmount = (pixelCount * INITIAL_USER_MINT * userRemaining) / USER_TOTAL_SUPPLY;
+
+            // Calculate proportional bank mint amount
+            bankMintAmount = (userMintAmount * BANK_TOTAL_SUPPLY) / USER_TOTAL_SUPPLY;
+
+            // Cap the mint amount to remaining supply if needed
+            if (s.stakingMintedRewards + userMintAmount > USER_TOTAL_SUPPLY) {
+                userMintAmount = USER_TOTAL_SUPPLY - s.stakingMintedRewards;
+                bankMintAmount = (userMintAmount * BANK_TOTAL_SUPPLY) / USER_TOTAL_SUPPLY;
+            }
+        }
 
         // Loop through the tokenIds and mint each LandPixel
         for (uint256 i = 0; i < pixelCount; i++) {
             _mintSingleLandPixel(msg.sender, tokenIds[i]);
         }
 
-        // Ensure we don't exceed our (staking + minting) allocation
-        require(s.stakingMintedRewards + userMintAmount <= USER_TOTAL_SUPPLY, "Exceeds user supply allocation");
-
-        // Mint decreasing amounts of DSTRX tokens
-        IMintableERC20(s.dstrxTokenAddress).mint(msg.sender, userMintAmount);
-        IMintableERC20(s.dstrxTokenAddress).mint(address(this), bankMintAmount);
-
-        // Record that we minted this amount, so the LandBankStakingFacet is aware of the supply change
-        s.stakingMintedRewards += userMintAmount;
+        // Mint rewards only if there are any to distribute
+        if (userMintAmount > 0) {
+            IMintableERC20(s.dstrxTokenAddress).mint(msg.sender, userMintAmount);
+            IMintableERC20(s.dstrxTokenAddress).mint(address(this), bankMintAmount);
+            s.stakingMintedRewards += userMintAmount;
+        }
 
         // Refund excess payment
         if (msg.value > totalCost) {
-            payable(msg.sender).transfer(msg.value - totalCost);
+            (bool success, ) = payable(msg.sender).call{value: msg.value - totalCost}("");
+            require(success, "Refund failed");
         }
 
         emit Deposit(msg.sender, totalCost);
@@ -101,7 +113,8 @@ contract LandBankMainFacet is ReentrancyGuard {
         uint256 burnAmount = (s.burnOnMintPercentage * totalCost) / 10000;
 
         // Burn the percentage of the deposit by sending native tokens to the burn address
-        payable(s.burnAddress).transfer(burnAmount);
+        (bool burnSuccess, ) = payable(s.burnAddress).call{value: burnAmount}("");
+        require(burnSuccess, "Burn transfer failed");
 
         emit Burn(burnAmount);
     }
@@ -162,7 +175,8 @@ contract LandBankMainFacet is ReentrancyGuard {
 
         // If the user sent more payment than required, refund the excess
         if (msg.value > totalCost) {
-            payable(msg.sender).transfer(msg.value - totalCost);
+            (bool success, ) = payable(msg.sender).call{value: msg.value - totalCost}("");
+            require(success, "Refund failed");
         }
 
         emit Deposit(msg.sender, totalCost);
@@ -195,8 +209,9 @@ contract LandBankMainFacet is ReentrancyGuard {
         // Transfer the LandPixel to the LandBank
         IERC721LandPixel(s.landPixelAddress).transferFrom(msg.sender, address(this), tokenId);
 
-        // Transfer the funds owed to the user
-        payable(msg.sender).transfer(amount);
+        // Transfer the funds owed to the user using call
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "Payment transfer failed");
 
         emit Withdrawal(msg.sender, amount);
         emit LandPixelSold(msg.sender, tokenId);

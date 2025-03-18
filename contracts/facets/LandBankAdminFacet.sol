@@ -104,7 +104,8 @@ contract LandBankAdminFacet is AccessControlInternal {
     function adminWithdraw(address payable recipient, uint amount) external {
         require(_hasRole(LANDBANK_ADMIN_ROLE, msg.sender), "Not LandBank admin");
 
-        recipient.transfer(amount);
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Admin withdrawal failed");
         emit AdminWithdrawal(recipient, amount);
     }
 
@@ -118,7 +119,8 @@ contract LandBankAdminFacet is AccessControlInternal {
     function adminWithdrawTokens(address tokenContract, address recipient, uint amount) external {
         require(_hasRole(LANDBANK_ADMIN_ROLE, msg.sender), "Not LandBank admin");
 
-        require(IERC20(tokenContract).transfer(recipient, amount));
+        bool success = IERC20(tokenContract).transfer(recipient, amount);
+        require(success, "Token withdrawal failed");
         emit AdminTokenWithdrawal(tokenContract, recipient, amount);
     }
 }

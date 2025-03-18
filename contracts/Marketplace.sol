@@ -7,6 +7,40 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+error InvalidDuration();
+error InvalidTokenContract();
+error TokenNotWhitelisted();
+error ZeroPrice();
+error NotTokenOwner();
+error AlreadyListed();
+error NotApproved();
+error InvalidBuyNowPrice();
+error ListingNotFound();
+error NotSeller();
+error CannotUnlist();
+error NotActive();
+error NotAuction();
+error SellerCannotBid();
+error AuctionEnded();
+error BidTooLow();
+error IncorrectPaymentAmount();
+error NativeTokenNotAccepted();
+error NoFundsToWithdraw();
+error TransferFailed();
+error CannotSelfOffer();
+error TokenIsListed();
+error ExistingActiveOffer();
+error OfferInactive();
+error InvalidOfferId();
+error OfferExpired();
+error CannotBuyOwnListing();
+error BuyNowUnavailable();
+error InsufficientPayment();
+error ListingExpired();
+error AuctionNotEnded();
+error FeeTooHigh();
+error CannotWhitelistNative();
+
 contract LandPixelMarketplace is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -16,6 +50,7 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
     }
 
     struct Listing {
+        uint256 listingId;
         SaleType saleType;
         address seller;
         address highestBidder;
@@ -24,8 +59,9 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         uint256 duration;
         bool active;
         uint256 buyNowPrice;
-        address paymentToken; // ETH = address(0)
+        address paymentToken; // native token = address(0)
         uint256 escrowedAmount; // Track escrowed amount for refunds
+        uint256 tokenId;
     }
 
     struct Offer {
@@ -35,13 +71,16 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         uint256 startTime;
         uint256 duration;
         bool active;
-        address paymentToken; // ETH = address(0)
+        address paymentToken; // native token = address(0)
     }
 
-    mapping(uint256 => Listing) public listings;
+    mapping(uint256 => Listing) public listings; // listingId => Listing
     mapping(uint256 => mapping(address => Offer)) public offers;
     mapping(address => mapping(address => uint256)) private escrowBalances; // user => token => amount
     mapping(uint256 => uint256) private nextOfferId; // tokenId => offerId
+    mapping(uint256 => uint256) public activeListingForToken;
+    mapping(address => bool) public whitelistedTokens;
+    uint256 private nextListingId = 1;
 
     uint256 public marketplaceFee = 2000; // 20% default fee (in basis points)
     address public landBank;
@@ -67,15 +106,17 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
     event FeeUpdated(uint256 newFee);
     event FeesCollected(address token, uint256 amount);
     event Unlisted(uint256 indexed tokenId, address indexed seller);
+    event TokenWhitelistUpdated(address token, bool isWhitelisted);
 
     modifier validDuration(uint256 duration) {
-        require(duration > 0 && duration <= MAX_DURATION, "Invalid duration");
+        if (duration == 0 || duration > MAX_DURATION) revert InvalidDuration();
         _;
     }
 
     modifier validPaymentToken(address token) {
         if (token != address(0)) {
-            require(token.code.length > 0, "Invalid token contract");
+            if (token.code.length == 0) revert InvalidTokenContract();
+            if (!whitelistedTokens[token]) revert TokenNotWhitelisted();
         }
         _;
     }
@@ -92,26 +133,29 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         uint256 duration,
         uint256 buyNowPrice,
         address paymentToken
-    ) external validDuration(duration) validPaymentToken(paymentToken) {
-        require(startingPrice > 0, "Price must be > 0");
-        require(landPixelContract.ownerOf(tokenId) == msg.sender, "Not owner");
-        require(listings[tokenId].active == false, "Already listed");
-        require(
-            landPixelContract.isApprovedForAll(msg.sender, address(this)) ||
-                landPixelContract.getApproved(tokenId) == address(this),
-            "Not approved"
-        );
+    ) external nonReentrant validDuration(duration) validPaymentToken(paymentToken) returns (uint256) {
+        if (startingPrice == 0) revert ZeroPrice();
+        if (landPixelContract.ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
+        if (activeListingForToken[tokenId] != 0) revert AlreadyListed();
+        if (
+            !landPixelContract.isApprovedForAll(msg.sender, address(this)) &&
+            landPixelContract.getApproved(tokenId) != address(this)
+        ) revert NotApproved();
 
         // Validate buyNowPrice if it's an auction
         if (saleType == SaleType.Auction) {
-            require(buyNowPrice == 0 || buyNowPrice > startingPrice, "Invalid buyNow price");
+            if (buyNowPrice != 0 && buyNowPrice <= startingPrice) revert InvalidBuyNowPrice();
         }
 
         // Transfer NFT to marketplace contract
         landPixelContract.transferFrom(msg.sender, address(this), tokenId);
 
+        // Generate new listing ID
+        uint256 listingId = nextListingId++;
+
         // Create listing
-        listings[tokenId] = Listing({
+        Listing memory newListing = Listing({
+            listingId: listingId,
             saleType: saleType,
             seller: msg.sender,
             highestBidder: msg.sender,
@@ -121,45 +165,52 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
             active: true,
             buyNowPrice: buyNowPrice,
             paymentToken: paymentToken,
-            escrowedAmount: 0
+            escrowedAmount: 0,
+            tokenId: tokenId
         });
 
+        listings[listingId] = newListing;
+        activeListingForToken[tokenId] = listingId;
+
         emit ListingCreated(tokenId, msg.sender, startingPrice, buyNowPrice, paymentToken);
+        return listingId;
     }
 
-    function unlist(uint256 tokenId) external {
-        Listing storage listing = listings[tokenId];
-        require(listing.seller == msg.sender, "Not the seller");
-        require(
-            listing.saleType == SaleType.FixedPrice &&
-                (listing.active || block.timestamp >= listing.startTime + listing.duration),
-            "Cannot unlist"
-        );
+    function unlist(uint256 listingId) external nonReentrant {
+        Listing storage listing = listings[listingId];
+        if (listing.listingId == 0) revert ListingNotFound();
+        if (listing.seller != msg.sender) revert NotSeller();
+        if (listing.saleType != SaleType.FixedPrice || !listing.active) revert CannotUnlist();
 
         // Update state first (CEI pattern)
         listing.active = false;
 
         // Return NFT to seller
-        landPixelContract.transferFrom(address(this), msg.sender, tokenId);
+        landPixelContract.transferFrom(address(this), msg.sender, listing.tokenId);
 
-        emit Unlisted(tokenId, msg.sender);
+        // Clear the active listing reference
+        activeListingForToken[listing.tokenId] = 0;
+
+        emit Unlisted(listing.tokenId, msg.sender);
     }
 
-    function bid(uint256 tokenId, uint256 bidAmount) external payable nonReentrant {
-        Listing storage listing = listings[tokenId];
-        require(listing.active, "Not active");
-        require(listing.saleType == SaleType.Auction, "Not auction");
-        require(listing.seller != msg.sender, "Seller cannot bid");
-        require(block.timestamp < listing.startTime + listing.duration, "Auction ended");
+    function bid(uint256 listingId, uint256 bidAmount) external payable nonReentrant {
+        Listing storage listing = listings[listingId];
+        if (listing.listingId == 0) revert ListingNotFound();
+        if (!listing.active) revert NotActive();
+        if (listing.saleType != SaleType.Auction) revert NotAuction();
+        if (listing.seller == msg.sender) revert SellerCannotBid();
+        if (block.timestamp >= listing.startTime + listing.duration) revert AuctionEnded();
+
         // Ensure minimum bid increment
         uint256 minBid = listing.highestBid + ((listing.highestBid * MIN_BID_INCREMENT_BPS) / 10000);
-        require(bidAmount >= minBid, "Bid too low");
+        if (bidAmount <= listing.highestBid || bidAmount < minBid) revert BidTooLow();
 
         // Handle payments first (CEI pattern)
         if (listing.paymentToken == address(0)) {
-            require(msg.value == bidAmount, "Incorrect ETH amount");
+            if (msg.value < bidAmount) revert InsufficientPayment();
         } else {
-            require(msg.value == 0, "ETH not accepted");
+            if (msg.value != 0) revert NativeTokenNotAccepted();
             // Transfer tokens to escrow
             IERC20(listing.paymentToken).safeTransferFrom(msg.sender, address(this), bidAmount);
         }
@@ -181,12 +232,18 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
             }
         }
 
-        emit BidPlaced(tokenId, msg.sender, bidAmount, listing.paymentToken);
+        // Return excess native token payment if any
+        if (listing.paymentToken == address(0) && msg.value > bidAmount) {
+            (bool refundSuccess, ) = payable(msg.sender).call{value: msg.value - bidAmount}("");
+            require(refundSuccess, "Refund failed");
+        }
+
+        emit BidPlaced(listing.tokenId, msg.sender, bidAmount, listing.paymentToken);
     }
 
     function withdrawEscrow(address token) external nonReentrant {
         uint256 amount = escrowBalances[msg.sender][token];
-        require(amount > 0, "No funds to withdraw");
+        if (amount == 0) revert NoFundsToWithdraw();
 
         // Update state before transfer (CEI pattern)
         escrowBalances[msg.sender][token] = 0;
@@ -194,7 +251,7 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         // Perform transfer
         if (token == address(0)) {
             (bool success, ) = payable(msg.sender).call{value: amount}("");
-            require(success, "ETH transfer failed");
+            if (!success) revert TransferFailed();
         } else {
             IERC20(token).safeTransfer(msg.sender, amount);
         }
@@ -206,18 +263,19 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         address paymentToken,
         uint256 amount
     ) external payable nonReentrant validDuration(duration) validPaymentToken(paymentToken) {
-        require(landPixelContract.ownerOf(tokenId) != msg.sender, "Cannot self-offer");
+        if (amount == 0) revert ZeroPrice();
+        if (landPixelContract.ownerOf(tokenId) == msg.sender) revert CannotSelfOffer();
+        if (activeListingForToken[tokenId] != 0) revert TokenIsListed();
 
         // Check for existing offer from this user
         Offer storage existingOffer = offers[tokenId][msg.sender];
-        require(!existingOffer.active, "Existing active offer");
+        if (existingOffer.active) revert ExistingActiveOffer();
 
         // Handle payment
         if (paymentToken == address(0)) {
-            require(msg.value == amount, "Incorrect ETH amount");
+            if (msg.value != amount) revert IncorrectPaymentAmount();
         } else {
-            require(msg.value == 0, "ETH not accepted");
-            require(amount > 0, "Amount must be > 0");
+            if (msg.value != 0) revert NativeTokenNotAccepted();
             IERC20(paymentToken).safeTransferFrom(msg.sender, address(this), amount);
         }
 
@@ -237,21 +295,26 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
     }
 
     function acceptOffer(uint256 tokenId, address offerer, uint256 offerId) external nonReentrant {
-        require(landPixelContract.ownerOf(tokenId) == msg.sender, "Not the token owner");
+        if (landPixelContract.ownerOf(tokenId) != msg.sender) revert NotTokenOwner();
 
         Offer storage offer = offers[tokenId][offerer];
-        require(offer.active, "Offer inactive");
-        require(offer.offerId == offerId, "Invalid offer ID");
-        require(block.timestamp < offer.startTime + offer.duration, "Offer expired");
+        if (!offer.active) revert OfferInactive();
+        if (offer.offerId != offerId) revert InvalidOfferId();
+        if (block.timestamp >= offer.startTime + offer.duration) revert OfferExpired();
 
+        // Store values in memory before state changes
         uint256 amount = offer.amount;
         address paymentToken = offer.paymentToken;
 
         // Deactivate the accepted offer
         offer.active = false;
+        // Clear any active listing reference if it exists
+        if (activeListingForToken[tokenId] != 0) {
+            activeListingForToken[tokenId] = 0;
+        }
 
-        // Calculate fees
-        uint256 feeAmount = (amount * marketplaceFee) / 10000;
+        // Calculate fees (rounding up)
+        uint256 feeAmount = (amount * marketplaceFee + 9999) / 10000;
         uint256 sellerAmount = amount - feeAmount;
 
         // Transfer NFT
@@ -260,9 +323,9 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         // Transfer payment
         if (paymentToken == address(0)) {
             (bool success, ) = payable(msg.sender).call{value: sellerAmount}("");
-            require(success, "Seller payment failed");
+            if (!success) revert TransferFailed();
             (bool feeSuccess, ) = payable(landBank).call{value: feeAmount}("");
-            require(feeSuccess, "Fee transfer failed");
+            if (!feeSuccess) revert TransferFailed();
         } else {
             IERC20(paymentToken).safeTransfer(msg.sender, sellerAmount);
             IERC20(paymentToken).safeTransfer(landBank, feeAmount);
@@ -271,32 +334,48 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         emit SaleFinalized(tokenId, offerer, amount, paymentToken);
     }
 
-    function buyNow(uint256 tokenId) external payable nonReentrant {
-        Listing storage listing = listings[tokenId];
-        require(msg.sender != listing.seller, "Cannot buy own listing");
-        require(listing.active, "Not for sale");
-        require(
-            listing.saleType == SaleType.FixedPrice ||
-                (listing.saleType == SaleType.Auction && listing.buyNowPrice > 0),
-            "Buy now not available"
-        );
+    function buyNow(uint256 listingId) external payable nonReentrant {
+        Listing storage listing = listings[listingId];
+        if (listing.listingId == 0) revert ListingNotFound();
+        if (msg.sender == listing.seller) revert CannotBuyOwnListing();
+        if (!listing.active) revert NotActive();
+        if (block.timestamp >= listing.startTime + listing.duration) revert ListingExpired();
+        if (
+            listing.saleType != SaleType.FixedPrice &&
+            (listing.saleType != SaleType.Auction || listing.buyNowPrice == 0)
+        ) revert BuyNowUnavailable();
 
-        uint256 price = listing.saleType == SaleType.FixedPrice ? listing.highestBid : listing.buyNowPrice;
+        uint256 price = listing.buyNowPrice;
+
+        // Calculate fees with safe math (rounding up)
+        uint256 feeAmount = (price * marketplaceFee + 9999) / 10000;
+        uint256 sellerAmount = price - feeAmount;
 
         // Handle payment first (CEI pattern)
         if (listing.paymentToken == address(0)) {
-            require(msg.value >= price, "Insufficient ETH");
+            if (msg.value < price) revert InsufficientPayment();
+
+            // Transfer to seller and landBank directly
+            (bool paymentTransferSuccess, ) = payable(listing.seller).call{value: sellerAmount}("");
+            require(paymentTransferSuccess, "Payment failed");
+
+            (bool feeTransferSuccess, ) = payable(landBank).call{value: feeAmount}("");
+            require(feeTransferSuccess, "Fee transfer failed");
+
+            // Return excess native token payment
+            if (msg.value > price) {
+                (bool refundSuccess, ) = payable(msg.sender).call{value: msg.value - price}("");
+                require(refundSuccess, "Refund failed");
+            }
         } else {
-            require(msg.value == 0, "ETH not accepted");
-            IERC20(listing.paymentToken).safeTransferFrom(msg.sender, address(this), price);
+            if (msg.value != 0) revert NativeTokenNotAccepted();
+            // Transfer tokens directly to seller and landBank
+            IERC20(listing.paymentToken).safeTransferFrom(msg.sender, listing.seller, sellerAmount);
+            IERC20(listing.paymentToken).safeTransferFrom(msg.sender, landBank, feeAmount);
         }
 
         // Update state
         listing.active = false;
-
-        // Calculate fees with safe math
-        uint256 feeAmount = (price * marketplaceFee) / 10000;
-        uint256 sellerAmount = price - feeAmount;
 
         // Handle existing auction refunds if necessary
         if (
@@ -309,69 +388,56 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         }
 
         // Transfer NFT
-        landPixelContract.transferFrom(address(this), msg.sender, tokenId);
+        landPixelContract.transferFrom(address(this), msg.sender, listing.tokenId);
 
-        // Handle payments
-        if (listing.paymentToken == address(0)) {
-            // Transfer to seller
-            (bool paymentTransferSuccess, ) = payable(listing.seller).call{value: sellerAmount}("");
-            require(paymentTransferSuccess, "Seller payment failed");
+        // Clear the active listing reference
+        activeListingForToken[listing.tokenId] = 0;
 
-            // Transfer fee
-            (bool feeTransferSuccess, ) = payable(landBank).call{value: feeAmount}("");
-            require(feeTransferSuccess, "Fee transfer failed");
-
-            // Return excess ETH
-            if (msg.value > price) {
-                (bool refundSuccess, ) = payable(msg.sender).call{value: msg.value - price}("");
-                require(refundSuccess, "Refund failed");
-            }
-        } else {
-            IERC20 token = IERC20(listing.paymentToken);
-            token.safeTransfer(listing.seller, sellerAmount);
-            token.safeTransfer(landBank, feeAmount);
-        }
-
-        emit SaleFinalized(tokenId, msg.sender, price, listing.paymentToken);
+        emit SaleFinalized(listing.tokenId, msg.sender, price, listing.paymentToken);
     }
 
-    function finalizeAuction(uint256 tokenId) external nonReentrant {
-        Listing storage listing = listings[tokenId];
-        require(listing.saleType == SaleType.Auction, "Not an auction");
-        require(listing.active, "Already finalized");
-        require(block.timestamp >= listing.startTime + listing.duration, "Auction not ended");
+    function finalizeAuction(uint256 listingId) external nonReentrant {
+        Listing storage listing = listings[listingId];
+        if (listing.listingId == 0) revert ListingNotFound();
+        if (listing.saleType != SaleType.Auction) revert NotAuction();
+        if (!listing.active) revert NotActive();
+        if (block.timestamp < listing.startTime + listing.duration) revert AuctionNotEnded();
 
-        // Update state first (CEI pattern)
-        listing.active = false;
-
+        // Store all needed values in memory before state changes
         address winner = listing.highestBidder;
         address seller = listing.seller;
         uint256 winningBid = listing.highestBid;
         address paymentToken = listing.paymentToken;
+        uint256 tokenId = listing.tokenId;
 
-        // If no valid bids, return NFT to seller
+        listing.active = false;
+        listing.escrowedAmount = 0;
+        activeListingForToken[tokenId] = 0;
+
+        // If no valid bids, return NFT to seller and exit early
         if (winner == seller) {
+            // External interaction
             landPixelContract.transferFrom(address(this), seller, tokenId);
             emit SaleFinalized(tokenId, seller, 0, paymentToken);
             return;
         }
 
-        // Calculate fees with safe math
-        uint256 feeAmount = (winningBid * marketplaceFee) / 10000;
+        // Calculate fees with safe math (rounding up)
+        uint256 feeAmount = (winningBid * marketplaceFee + 9999) / 10000;
         uint256 sellerAmount = winningBid - feeAmount;
 
-        // Transfer NFT first (since we've already updated state)
+        // Transfer NFT
         landPixelContract.transferFrom(address(this), winner, tokenId);
 
         // Handle payments
         if (paymentToken == address(0)) {
-            // Transfer ETH to seller
+            // Transfer native token to seller
             (bool successSeller, ) = payable(seller).call{value: sellerAmount}("");
-            require(successSeller, "Seller payment failed");
+            if (!successSeller) revert TransferFailed();
 
             // Transfer fees
             (bool successFees, ) = payable(landBank).call{value: feeAmount}("");
-            require(successFees, "Fee transfer failed");
+            if (!successFees) revert TransferFailed();
         } else {
             IERC20 token = IERC20(paymentToken);
             // Transfer winning bid to seller (minus fees)
@@ -380,15 +446,12 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
             token.safeTransfer(landBank, feeAmount);
         }
 
-        // Clear any escrowed amount
-        listing.escrowedAmount = 0;
-
         emit SaleFinalized(tokenId, winner, winningBid, paymentToken);
     }
 
     function withdrawOffer(uint256 tokenId) external nonReentrant {
         Offer storage offer = offers[tokenId][msg.sender];
-        require(offer.active, "No active offer");
+        if (!offer.active) revert OfferInactive();
 
         // Update state first (CEI pattern)
         uint256 amount = offer.amount;
@@ -398,7 +461,7 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
         // Transfer funds
         if (paymentToken == address(0)) {
             (bool success, ) = payable(msg.sender).call{value: amount}("");
-            require(success, "ETH withdrawal failed");
+            if (!success) revert TransferFailed();
         } else {
             IERC20(paymentToken).safeTransfer(msg.sender, amount);
         }
@@ -409,15 +472,24 @@ contract LandPixelMarketplace is Ownable, ReentrancyGuard {
     /*******************************************************************************************\
      *  view function to check minimum required bid
     \*******************************************************************************************/
-    function getMinimumBid(uint256 tokenId) external view returns (uint256) {
-        Listing storage listing = listings[tokenId];
-        require(listing.active && listing.saleType == SaleType.Auction, "Not active auction");
+    function getMinimumBid(uint256 listingId) external view returns (uint256) {
+        Listing storage listing = listings[listingId];
+        if (listing.listingId == 0) revert ListingNotFound();
+        if (!listing.active || listing.saleType != SaleType.Auction) revert NotAuction();
         return listing.highestBid + ((listing.highestBid * MIN_BID_INCREMENT_BPS) / 10000);
     }
 
-    // admin functions
+    // admin function to set marketplace fee
     function setMarketplaceFee(uint256 newFee) external onlyOwner {
-        require(newFee <= MAX_FEE, "Fee too high");
+        if (newFee > MAX_FEE) revert FeeTooHigh();
         marketplaceFee = newFee;
+    }
+
+    // admin function to manage whitelisted tokens
+    function setTokenWhitelisted(address token, bool isWhitelisted) external onlyOwner {
+        if (token == address(0)) revert CannotWhitelistNative();
+        if (token.code.length == 0) revert InvalidTokenContract();
+        whitelistedTokens[token] = isWhitelisted;
+        emit TokenWhitelistUpdated(token, isWhitelisted);
     }
 }
