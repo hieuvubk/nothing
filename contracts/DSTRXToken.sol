@@ -45,6 +45,10 @@ contract DSTRXToken is ERC20, ERC20Burnable, AccessControl, ERC20Permit, ERC20Vo
         _mint(to, amount);
     }
 
+    function burn(address from, uint256 amount) public onlyRole(MINTER_ROLE) {
+        _burn(from, amount);
+    }
+
     function updateDailyMintCap(uint256 newCap) external onlyRole(DEFAULT_ADMIN_ROLE) {
         pendingDailyMintCap = newCap;
         dailyMintCapUpdateTimestamp = block.timestamp;
