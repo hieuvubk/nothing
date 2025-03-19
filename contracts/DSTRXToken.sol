@@ -25,6 +25,7 @@ contract DSTRXToken is ERC20, ERC20Burnable, AccessControl, ERC20Permit, ERC20Vo
     constructor(address initialOwner) ERC20("Districts Token", "DSTRX") ERC20Permit("DSTRXToken") {
         _grantRole(DEFAULT_ADMIN_ROLE, initialOwner);
         _grantRole(MINTER_ROLE, initialOwner);
+        _mint(initialOwner, 1000000 * 10 ** decimals());
     }
 
     function mint(address to, uint256 amount) public onlyRole(MINTER_ROLE) {
